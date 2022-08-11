@@ -35,6 +35,8 @@ from tornado import iostream
 from tornado import netutil
 from tornado.tcpserver import TCPServer
 from tornado.util import Configurable
+from tornado import gen
+from tornado.ioloop import IOLoop
 from tornado.log import gen_log
 
 import pyodide
@@ -46,7 +48,60 @@ if typing.TYPE_CHECKING:
     from typing import Set  # noqa: F401
 
 
-class JsWsConnection:
+import asyncio
+
+
+class JsHTTPConnection:
+    """ Implementation of `httputil.HTTPConnection`
+    for communication with the stlite JavaScript code
+    that replaces `HTTP1Connection` in the original Tornado.
+    """
+    def __init__(self, callback) -> None:
+        self._write_buffer = b""
+        self._start_line = None
+        self._headers = None
+        self._callback = callback
+
+    def write_headers(
+        self,
+        start_line: httputil.ResponseStartLine,
+        headers: httputil.HTTPHeaders,
+        chunk: Optional[bytes] = None,
+    ) -> "Future[None]":
+        gen_log.debug("JsConnection.write_headers(), %s, %s, %s", start_line, str(headers), chunk)
+        self._start_line = start_line
+        self._headers = headers
+        self._write_buffer += chunk
+
+        # Return a no-op future. Ref https://github.com/tornadoweb/tornado/blob/v6.2.0/tornado/web.py#L1106-L1108
+        future = asyncio.Future()
+        future.set_result(None)
+        return future
+
+    def write(self, chunk: bytes) -> "Future[None]":
+        gen_log.debug("JsConnection.write(), %s", chunk)
+        self._write_buffer += chunk
+
+        # Return a no-op future. Ref https://github.com/tornadoweb/tornado/blob/v6.2.0/tornado/web.py#L1106-L1108
+        future = asyncio.Future()
+        future.set_result(None)
+        return future
+
+    def finish(self) -> None:
+        gen_log.debug("JsConnection.flush()")
+        if self._start_line is None:
+            raise Exception("start line is not set")
+        if self._headers is None:
+            raise Exception("headers are not set")
+        self._callback(self._start_line.code, dict(self._headers), self._write_buffer)
+
+    def set_close_callback(self, callback: Optional[Callable[[], None]]) -> None:
+        self._close_callback = callback
+
+
+class JsWebSocketProtocol:
+    """ A replacement of `tornado.websocket.WebSocketProtocol`
+    for stlite WebSocket communication """
     def __init__(self, callback) -> None:
         self._callback = callback
 
@@ -56,24 +111,10 @@ class JsWsConnection:
     def is_closing(self):
         return False
 
-    def set_close_callback(self, callback: Optional[Callable[[], None]]) -> None:
-        """Sets a callback that will be run when the connection is closed.
-
-        Note that this callback is slightly different from
-        `.HTTPMessageDelegate.on_connection_close`: The
-        `.HTTPMessageDelegate` method is called when the connection is
-        closed while receiving a message. This callback is used when
-        there is not an active delegate (for example, on the server
-        side this callback is used if the client closes the connection
-        after sending its request but before receiving all the
-        response.
-        """
-        self._close_callback = callback
-
 
 class FindHandler:
     @classmethod
-    def _find_handler(cls, router, request, **kwargs: Any):
+    def find_handler(cls, router, request, **kwargs: Any):
         # Based on https://github.com/tornadoweb/tornado/blob/a4f08a31a348445094d1efa17880ed5472db9f7d/tornado/routing.py#L361
         for rule in router.rules:
             target_params = rule.matcher.match(request)
@@ -93,7 +134,7 @@ class FindHandler:
         from tornado.routing import Router
 
         if isinstance(target, Router):
-            return cls._find_handler(target, request, **target_params)
+            return cls.find_handler(target, request, **target_params)
 
         elif callable(target):
             return target, target_params
@@ -286,10 +327,10 @@ class HTTPServer(TCPServer, Configurable, httputil.HTTPServerConnectionDelegate)
             # Streamlit's server.py checks the header for `st.user`: https://github.com/streamlit/streamlit/blob/ace58bfa3582d4f8e7f281b4dbd266ddd8a32b54/lib/streamlit/server/server.py#L687
             # so set the headers here although the content is empty, which leads to a dummy local user identity.
             headers=httputil.HTTPHeaders(),
-            connection=JsWsConnection(on_websocket_message),  # TODO: This should be HTTP Connection
+            connection=JsHTTPConnection(lambda _: _),
         )
 
-        websocket_handler_class, target_params = FindHandler._find_handler(self.application.default_router, request)
+        websocket_handler_class, target_params = FindHandler.find_handler(self.application.default_router, request)
         if websocket_handler_class is None:
             gen_log.warning("WebSocket connection for path %s has been requested, but no handler found", path)
             return
@@ -300,7 +341,7 @@ class HTTPServer(TCPServer, Configurable, httputil.HTTPServerConnectionDelegate)
             return
 
         websocket_handler.open()
-        websocket_handler.ws_connection = JsWsConnection(on_websocket_message)
+        websocket_handler.ws_connection = JsWebSocketProtocol(on_websocket_message)
 
         self.websocket_handler = websocket_handler
 
@@ -318,9 +359,6 @@ class HTTPServer(TCPServer, Configurable, httputil.HTTPServerConnectionDelegate)
             gen_log.warning("WebSocket is not open")
             return
 
-        from tornado import gen
-        from tornado.ioloop import IOLoop
-
         # Mimic https://github.com/tornadoweb/tornado/blob/v6.2.0/tornado/websocket.py#L626-L645
         try:
             result = self.websocket_handler.on_message(payload)
@@ -333,6 +371,37 @@ class HTTPServer(TCPServer, Configurable, httputil.HTTPServerConnectionDelegate)
                 result = gen.convert_yielded(result)
                 IOLoop.current().add_future(result, lambda f: f.result())
             return result
+
+    def receive_http_from_js(self, method: str, path: str, headers: pyodide.JsProxy, body: pyodide.JsProxy, on_response: Callable[[int, dict, bytes], None]):
+        return self.receive_http(method=method, path=path, headers=headers.to_py(), body=body.to_bytes(), on_response=on_response)
+
+    def receive_http(self, method: str, path: str, headers: dict, body: Union[str, bytes], on_response: Callable[[int, dict, bytes], None]):
+        gen_log.debug("HTTP request (%s %s %s %s)", method, path, headers, body)
+
+        request = httputil.HTTPServerRequest(
+            method=method,
+            uri=path,
+            headers=headers,
+            body=body if isinstance(body, bytes) else body.encode("utf8"),
+            connection=JsHTTPConnection(on_response),
+        )
+
+        request_handler_class, target_params = FindHandler.find_handler(self.application.default_router, request)
+        if request_handler_class is None:
+            gen_log.info("HTTP request for path %s has been sent, but no handler found", path)
+            return
+
+        handler = request_handler_class(application=self.application, request=request, **target_params["target_kwargs"])
+
+        # Mimic tornado.web._HandlerDelegate.execute()
+        # Ref: https://github.com/tornadoweb/tornado/blob/v6.2.0/tornado/web.py#L2330
+        transforms = []
+        path_args = target_params.get("path_args", [])
+        path_kwargs = target_params.get("path_kwargs", {})
+        fut = gen.convert_yielded(
+            handler._execute(transforms, *path_args, **path_kwargs)
+        )
+        return fut
 
     @classmethod
     def configurable_base(cls) -> Type[Configurable]:
