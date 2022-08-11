@@ -35,12 +35,75 @@ from tornado import iostream
 from tornado import netutil
 from tornado.tcpserver import TCPServer
 from tornado.util import Configurable
+from tornado.log import gen_log
+
+import pyodide
 
 import typing
 from typing import Union, Any, Dict, Callable, List, Type, Tuple, Optional, Awaitable
 
 if typing.TYPE_CHECKING:
     from typing import Set  # noqa: F401
+
+
+class JsWsConnection:
+    def __init__(self, callback) -> None:
+        self._callback = callback
+
+    def write_message(self, message: bytes, binary: bool = False):
+        self._callback(message, binary=binary)
+
+    def is_closing(self):
+        return False
+
+    def set_close_callback(self, callback: Optional[Callable[[], None]]) -> None:
+        """Sets a callback that will be run when the connection is closed.
+
+        Note that this callback is slightly different from
+        `.HTTPMessageDelegate.on_connection_close`: The
+        `.HTTPMessageDelegate` method is called when the connection is
+        closed while receiving a message. This callback is used when
+        there is not an active delegate (for example, on the server
+        side this callback is used if the client closes the connection
+        after sending its request but before receiving all the
+        response.
+        """
+        self._close_callback = callback
+
+
+class FindHandler:
+    @classmethod
+    def _find_handler(cls, router, request, **kwargs: Any):
+        # Based on https://github.com/tornadoweb/tornado/blob/a4f08a31a348445094d1efa17880ed5472db9f7d/tornado/routing.py#L361
+        for rule in router.rules:
+            target_params = rule.matcher.match(request)
+            if target_params is not None:
+                if rule.target_kwargs:
+                    target_params["target_kwargs"] = rule.target_kwargs
+
+                handler, kwargs = cls._get_handler(rule.target, request, **target_params)
+
+                if handler is not None:
+                    return handler, kwargs
+
+        return None
+
+    @classmethod
+    def _get_handler(cls, target: Any, request, **target_params: Any):
+        from tornado.routing import Router
+
+        if isinstance(target, Router):
+            return cls._find_handler(target, request, **target_params)
+
+        elif callable(target):
+            return target, target_params
+
+        return None
+
+
+
+# HACK: Escape hatch to access the server instance from outside, e.g. Java Script world through Pyodide
+HTTP_SERVER: Optional["HTTPServer"] = None
 
 
 class HTTPServer(TCPServer, Configurable, httputil.HTTPServerConnectionDelegate):
@@ -153,7 +216,9 @@ class HTTPServer(TCPServer, Configurable, httputil.HTTPServerConnectionDelegate)
        The ``io_loop`` argument has been removed.
     """
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, application, *args: Any, **kwargs: Any) -> None:
+        self.application = application  # HACK: for stlite
+
         # Ignore args to __init__; real initialization belongs in
         # initialize since we're Configurable. (there's something
         # weird in initialization order between this class,
@@ -204,6 +269,70 @@ class HTTPServer(TCPServer, Configurable, httputil.HTTPServerConnectionDelegate)
         )
         self._connections = set()  # type: Set[HTTP1ServerConnection]
         self.trusted_downstream = trusted_downstream
+
+    def listen(self, port: int, address: str = "") -> None:
+        # HACK: for stlite
+        global HTTP_SERVER
+        if HTTP_SERVER:
+            gen_log.warning("An HTTPServer instance already exists. Overwrite the global one.")
+        HTTP_SERVER = self
+        pass
+
+    def start_websocket(self, path: str, on_websocket_message: Callable[[bytes], None]):
+        from tornado.websocket import WebSocketHandler
+
+        request = httputil.HTTPServerRequest(
+            uri=path,
+            # Streamlit's server.py checks the header for `st.user`: https://github.com/streamlit/streamlit/blob/ace58bfa3582d4f8e7f281b4dbd266ddd8a32b54/lib/streamlit/server/server.py#L687
+            # so set the headers here although the content is empty, which leads to a dummy local user identity.
+            headers=httputil.HTTPHeaders(),
+            connection=JsWsConnection(on_websocket_message),  # TODO: This should be HTTP Connection
+        )
+
+        websocket_handler_class, target_params = FindHandler._find_handler(self.application.default_router, request)
+        if websocket_handler_class is None:
+            gen_log.warning("WebSocket connection for path %s has been requested, but no handler found", path)
+            return
+        gen_log.debug("Start WebSocket connection for %s using the handler %s", path, websocket_handler_class)
+        websocket_handler = websocket_handler_class(application=self.application, request=request, **target_params["target_kwargs"])
+        if not isinstance(websocket_handler, WebSocketHandler):
+            gen_log.warning("WebSocket connection for path %s has been requested, but no WebSocket handler found", path)
+            return
+
+        websocket_handler.open()
+        websocket_handler.ws_connection = JsWsConnection(on_websocket_message)
+
+        self.websocket_handler = websocket_handler
+
+    def receive_websocket_from_js(self, payload_from_js: pyodide.JsProxy):
+        payload = payload_from_js.to_bytes()
+
+        if not isinstance(payload, bytes):
+            gen_log.warning("The WebSocket payload is not of type bytes, but %s", type(payload))
+            return
+
+        self.receive_websocket(payload)
+
+    def receive_websocket(self, payload: bytes):
+        if self.websocket_handler is None:
+            gen_log.warning("WebSocket is not open")
+            return
+
+        from tornado import gen
+        from tornado.ioloop import IOLoop
+
+        # Mimic https://github.com/tornadoweb/tornado/blob/v6.2.0/tornado/websocket.py#L626-L645
+        try:
+            result = self.websocket_handler.on_message(payload)
+        except Exception:
+            self.handler.log_exception(*sys.exc_info())
+            self._abort()
+            return None
+        else:
+            if result is not None:
+                result = gen.convert_yielded(result)
+                IOLoop.current().add_future(result, lambda f: f.result())
+            return result
 
     @classmethod
     def configurable_base(cls) -> Type[Configurable]:
