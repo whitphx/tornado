@@ -372,8 +372,26 @@ class HTTPServer(TCPServer, Configurable, httputil.HTTPServerConnectionDelegate)
                 IOLoop.current().add_future(result, lambda f: f.result())
             return result
 
-    def receive_http_from_js(self, method: str, path: str, headers: pyodide.JsProxy, body: pyodide.JsProxy, on_response: Callable[[int, dict, bytes], None]):
-        return self.receive_http(method=method, path=path, headers=headers.to_py(), body=body.to_bytes(), on_response=on_response)
+    def receive_http_from_js(
+        self,
+        method: str,
+        path: str,
+        headers: pyodide.JsProxy,
+        body: Union[str, pyodide.JsProxy],
+        on_response: Callable[[int, dict, bytes], None]
+    ):
+        headers = headers.to_py()
+
+        if isinstance(body, pyodide.JsProxy):
+            body = body.to_bytes()
+
+        return self.receive_http(
+            method=method,
+            path=path,
+            headers=headers,
+            body=body,
+            on_response=on_response
+        )
 
     def receive_http(self, method: str, path: str, headers: dict, body: Union[str, bytes], on_response: Callable[[int, dict, bytes], None]):
         gen_log.debug("HTTP request (%s %s %s %s)", method, path, headers, body)
