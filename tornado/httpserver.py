@@ -39,7 +39,7 @@ from tornado import gen
 from tornado.ioloop import IOLoop
 from tornado.log import gen_log
 
-import pyodide
+import pyodide.ffi
 
 import typing
 from typing import Union, Any, Dict, Callable, List, Type, Tuple, Optional, Awaitable
@@ -345,7 +345,7 @@ class HTTPServer(TCPServer, Configurable, httputil.HTTPServerConnectionDelegate)
 
         self.websocket_handler = websocket_handler
 
-    def receive_websocket_from_js(self, payload_from_js: pyodide.JsProxy):
+    def receive_websocket_from_js(self, payload_from_js: pyodide.ffi.JsProxy):
         payload = payload_from_js.to_bytes()
 
         if not isinstance(payload, bytes):
@@ -376,13 +376,13 @@ class HTTPServer(TCPServer, Configurable, httputil.HTTPServerConnectionDelegate)
         self,
         method: str,
         path: str,
-        headers: pyodide.JsProxy,
-        body: Union[str, pyodide.JsProxy],
+        headers: pyodide.ffi.JsProxy,
+        body: Union[str, pyodide.ffi.JsProxy],
         on_response: Callable[[int, dict, bytes], None]
     ):
         headers = headers.to_py()
 
-        if isinstance(body, pyodide.JsProxy):
+        if isinstance(body, pyodide.ffi.JsProxy):
             body = body.to_bytes()
 
         return self.receive_http(
